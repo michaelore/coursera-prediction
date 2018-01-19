@@ -1,0 +1,128 @@
+---
+title: "Evaluating Weightlifting Form with Machine Learning"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+This is the final project for Coursera's Practical Machine Learning course. I'm using a public dataset with data from wearable electronics collecting while lifting a barbell. The exercise was done either while performing the exercise correctly or while performing it incorrectly in one of four different ways. This is indicated in the `classe` variable with 'A' as the correct method and 'B' through 'E' as the common mistakes.
+
+I split the given data 60-40 into a training set and validation set.
+
+The first 7 variables don't contain generalizable information and are more likely to lead to overfitting and contamination between the training and validation sets. These include the measurement indices, test subject IDs, timestamps, and IDs for windows of data collection. I drop these columns.
+
+I'd found that any columns with missing values or empty strings contain almost entirely such values, so I drop all of them. Finally, I drop any columns with few unique values as determined by `nearZeroVar` from `caret`.
+
+```{r, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(caret)
+library(ranger)
+```
+
+```{r, cache=TRUE}
+pml.raw <- read.csv('pml-training.csv', stringsAsFactors = FALSE)
+pml.test.raw <- read.csv('pml-testing.csv', stringsAsFactors = FALSE)
+
+pml.raw$classe <- factor(pml.raw$classe)
+
+set.seed(2413)
+
+split <- 0.6
+trainIndex <- createDataPartition(pml.raw$classe, p=split, list=FALSE)
+pml.train.raw <- pml.raw[trainIndex,]
+pml.valid.raw <- pml.raw[-trainIndex,]
+
+otherDrop <- 1:7
+anyNA <- which(apply(is.na(pml.raw), 2, sum)>0)
+anyEmpty <- which(apply(pml.raw=='', 2, sum)>0)
+nzv <- nearZeroVar(pml.train.raw)
+drop <- c(nzv, anyNA, anyEmpty, otherDrop)
+
+pml <- pml.raw[,-drop]
+pml.train <- pml.train.raw[,-drop]
+pml.valid <- pml.valid.raw[,-drop]
+pml.test <- pml.test.raw[,-drop]
+```
+
+I decided to primarily evaluate models by computing the log loss from the predicted probabilities of each class and secondarily by reviewing the confusion matrix and associated statistics for an intuitive picture of how my models are doing.
+
+As a baseline, I created a model that ignores all predictor data and just outputs the frequencies of each response class in the training set. Below, I evaluate this against the validation set.
+
+```{r}
+base.probs <- table(pml.train$classe)/nrow(pml.train)
+response.levels <- c('A','B','C','D','E')
+baseline <- matrix(rep(base.probs, nrow(pml.valid)), ncol = 5, byrow=TRUE)
+baseline <- data.frame(baseline)
+names(baseline) <- response.levels
+
+baseline$pred <- rep(factor('A', levels=response.levels), nrow(pml.valid))
+baseline$obs <- pml.valid$classe
+
+confusionMatrix(baseline$pred, baseline$obs)
+mnLogLoss(baseline, response.levels)
+```
+
+We should hope my models at least get a better log loss than 1.59 and a better accuracy than 0.28.
+
+I intend to start with my two favorite models: random forest and elastic net regression. I'll do parameter tuning for these models through 5-fold cross-validation strictly in the training set, then use the final models trained on the whole training set split and compare their performance on the validation set. This validation set performance will also be used to predict performance in practice. If I'm not satisfied with the performance thus far, I'll consider other models, possibly with features selected by random forest variable importance or elastic net regression coefficients.
+
+The training and validation splits will be recombined to train the final model used on the test set for course evaluation of my project.
+
+```{r}
+control <- trainControl(number = 5, classProbs=TRUE, summaryFunction=mnLogLoss)
+```
+
+First, random forest, with the `ranger` package.
+
+```{r, cache=TRUE}
+rf <- train(classe ~ ., data=pml.train, trControl = control, method='ranger', metric='logLoss')
+```
+
+```{r}
+rf
+```
+
+The log loss is much better than the baseline. I expect log loss to be a somewhat unfair metric when comparing to logistic regression, since random forest more directly optimizes for accuracy and logistic regression more directly optimizes for log loss. There are extra things I could do to improve calibration of class probabilities given a fitted model, but I'll proceed without doing that.
+
+Next is generalized (i.e. logistic) elastic net regression through `glmnet`.
+
+```{r, cache=TRUE}
+glmnet <- train(classe ~ ., data=pml.train, trControl = control, method='glmnet', metric='logLoss')
+```
+
+```{r}
+glmnet
+```
+
+Log loss is better than baseline, but not as good as with random forest, at least on the cross-validation resamples.
+
+```{r}
+pred.rf <- predict(rf, newdata=pml.valid, type='raw')
+confusionMatrix(pred.rf, pml.valid$classe)
+
+pred.rf.class <- predict(rf, newdata=pml.valid, type='prob')
+pred.rf.class$pred <- pred.rf
+pred.rf.class$obs <- pml.valid$classe
+mnLogLoss(pred.rf.class, lev = levels(pml.valid$classe))
+```
+
+```{r}
+pred.glmnet <- predict(glmnet, newdata=pml.valid, type='raw')
+confusionMatrix(pred.glmnet, pml.valid$classe)
+
+pred.glmnet.class <- predict(glmnet, newdata=pml.valid, type='prob')
+pred.glmnet.class$pred <- pred.glmnet
+pred.glmnet.class$obs <- pml.valid$classe
+mnLogLoss(pred.glmnet.class, lev = levels(pml.valid$classe))
+```
+
+Random forest is still better, with a log loss of 0.086 vs 0.72 for elastic net. I don't see anything suspect in the confusion matrix. Performance looks good enough, so I'll use this for prediction on the final test data set.
+
+```{r, cache=TRUE}
+rf.final <- ranger(classe ~ ., pml, min.node.size = 1, mtry = 52, splitrule = 'gini')
+```
+
+```{r}
+pred.final <- predict(rf.final, pml.test, type='response')
+#cbind(pred.final$predictions)
+```
